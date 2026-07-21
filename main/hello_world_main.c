@@ -1,43 +1,40 @@
-/*
- * ICM42688 IMU + 自适应卡尔曼滤波器
+/**
+ * @file    hello_world_main.c
+ * @brief   ICM42688 IMU 双滤波器姿态解算
  *
- * 数据流：
- *   原始数据 → 零漂补偿 → 自适应卡尔曼融合 → 欧拉角
+ * 数据流:
+ *   Pipeline 1: 原始数据 → 卡尔曼滤波 → 四元数 → 欧拉角
+ *   Pipeline 2: 原始数据 → Mahony 滤波 → 四元数 → 欧拉角
  *
- * 特性：
- *   - 自适应测量噪声 R（振动检测）
- *   - 自适应过程噪声 Q（运动检测）
- *   - Yaw 死区抑制漂移
- *
- * 输出格式：VOFA FireWater
- *   Roll,Pitch,Yaw\n
+ * 公共特性: 零漂标定、振动自适应、Yaw 死区
  */
 
 #include <stdio.h>
-#include <inttypes.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_chip_info.h"
-#include "esp_system.h"
 #include "esp_log.h"
 #include "icm42688.h"
 #include "kalman.h"
+#include "ahrs.h"
 
 static const char *TAG = "main";
 
 /* ==================== 采样参数 ==================== */
+
 #define SAMPLE_RATE     200
 #define SAMPLE_DT_MS    (1000 / SAMPLE_RATE)
 #define SAMPLE_DT_S     (1.0f / SAMPLE_RATE)
 
 /* ==================== 零漂标定 ==================== */
+
 #define CALIBRATE_COUNT 500
 
 static float s_gyro_offset_x = 0, s_gyro_offset_y = 0, s_gyro_offset_z = 0;
 
 /**
- * @brief   陀螺仪零漂标定
+ * @brief   陀螺仪零漂标定（500 样本平均）
  */
 static void calibrate_gyro(void)
 {
@@ -63,69 +60,78 @@ static void calibrate_gyro(void)
 }
 
 /**
- * @brief   IMU + 姿态解算任务
+ * @brief   IMU + 双滤波器姿态解算任务
  */
 static void imu_task(void *arg)
 {
     icm42688_sensor_data_t data;
     kalman_output_t kalman_out;
+    mahony_output_t mahony_out;
 
-    // 等待系统稳定
+    /* 等待系统稳定 */
     vTaskDelay(pdMS_TO_TICKS(500));
 
-    // 初始化 ICM42688
+    /* 初始化 ICM42688 */
     ESP_LOGI(TAG, "Initializing ICM42688...");
     if (icm42688_init(NULL) != 0) {
         ESP_LOGE(TAG, "ICM42688 init failed!");
         vTaskDelete(NULL);
         return;
     }
-
     ESP_LOGI(TAG, "ICM42688 init OK, WHO_AM_I = 0x%02X", icm42688_read_id());
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    // 零漂标定
+    /* 零漂标定 */
     calibrate_gyro();
 
-    // 初始化自适应卡尔曼滤波器
+    /* 初始化两个滤波器 */
     kalman_init();
 
-    ESP_LOGI(TAG, "=== 自适应卡尔曼滤波器启动 ===");
-    ESP_LOGI(TAG, "特性: 自适应R(振动) + 自适应Q(运动) + Yaw死区");
-    ESP_LOGI(TAG, "采样率: %d Hz", SAMPLE_RATE);
-    ESP_LOGI(TAG, "输出格式: Roll,Pitch,Yaw (VOFA FireWater)");
+    /* 读取当前加速度计数据，用于 Mahony 四元数初始化 */
+    icm42688_sensor_data_t init_data;
+    icm42688_get_all_data(&init_data);
+    mahony_init(init_data.ax, init_data.ay, init_data.az);
 
-    // 主循环
+    ESP_LOGI(TAG, "=== 双滤波器启动 ===");
+    ESP_LOGI(TAG, "Pipeline 1: 卡尔曼滤波 → 四元数 → 欧拉角");
+    ESP_LOGI(TAG, "Pipeline 2: Mahony 滤波 → 四元数 → 欧拉角");
+    ESP_LOGI(TAG, "公共特性: 自适应R/Kp(振动) + 自适应Q(运动) + Yaw死区");
+    ESP_LOGI(TAG, "采样率: %d Hz", SAMPLE_RATE);
+
+    /* 主循环 */
     while (1) {
-        // 1. 读取原始数据
+        /* 1. 读取原始数据（一次读取，两个滤波器共用） */
         icm42688_get_all_data(&data);
 
-        // 2. 零漂补偿
+        /* 2. 零漂补偿 */
         float gx = data.gx - s_gyro_offset_x;
         float gy = data.gy - s_gyro_offset_y;
         float gz = data.gz - s_gyro_offset_z;
 
-        // 3. 自适应卡尔曼滤波
+        /* 3. 卡尔曼滤波 */
         kalman_update(gx, gy, gz, data.ax, data.ay, data.az, SAMPLE_DT_S, &kalman_out);
 
-        // 4. VOFA 格式输出
-        printf("%.2f,%.2f,%.2f\n", kalman_out.roll, kalman_out.pitch, kalman_out.yaw);
+        /* 4. Mahony 滤波 */
+        mahony_update(gx, gy, gz, data.ax, data.ay, data.az, SAMPLE_DT_S, &mahony_out);
 
-        // 精确采样率控制
+        /* 5. VOFA 输出 */
+        printf("K:%.2f,%.2f,%.2f,M:%.2f,%.2f,%.2f\n",
+               (double)kalman_out.euler.roll, (double)kalman_out.euler.pitch, (double)kalman_out.euler.yaw,
+               (double)mahony_out.euler.roll, (double)mahony_out.euler.pitch, (double)mahony_out.euler.yaw);
+
+        /* 精确采样率控制 */
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_DT_MS));
     }
 }
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "ESP32 ICM42688 IMU - 自适应卡尔曼滤波器");
+    ESP_LOGI(TAG, "ESP32 ICM42688 IMU - 双滤波器姿态解算");
 
-    // 打印芯片信息
     esp_chip_info_t chip_info;
     esp_chip_info(&chip_info);
     ESP_LOGI(TAG, "Chip: %s, cores: %d, revision: %d",
              CONFIG_IDF_TARGET, chip_info.cores, chip_info.revision);
 
-    // 创建任务
     xTaskCreate(imu_task, "imu_task", 8192, NULL, 5, NULL);
 }

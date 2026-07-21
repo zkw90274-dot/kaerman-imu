@@ -151,12 +151,12 @@ uint8_t hw_spi_read_reg(hw_spi_t *spi, uint8_t reg)
 void hw_spi_read_regs(hw_spi_t *spi, uint8_t reg, uint8_t *buf, uint16_t len)
 {
     /* 命令字节 + 数据字节，一次事务完成 */
-    uint8_t *tx_buf = heap_caps_malloc(1 + len, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    uint8_t *rx_buf = heap_caps_malloc(1 + len, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    if (!tx_buf || !rx_buf) {
-        ESP_LOGE(TAG, "malloc failed in read_registers");
-        free(tx_buf);
-        free(rx_buf);
+    /* 最大 14 字节 (IMU: temp2 + accel6 + gyro6)，使用栈缓冲区 */
+    uint8_t tx_buf[15];
+    uint8_t rx_buf[15];
+
+    if (len > 14) {
+        ESP_LOGE(TAG, "read_regs: len %d exceeds max 14", len);
         return;
     }
 
@@ -174,7 +174,4 @@ void hw_spi_read_regs(hw_spi_t *spi, uint8_t reg, uint8_t *buf, uint16_t len)
     gpio_set_level(spi->cs_pin, 1);
 
     memcpy(buf, rx_buf + 1, len);
-
-    free(tx_buf);
-    free(rx_buf);
 }
