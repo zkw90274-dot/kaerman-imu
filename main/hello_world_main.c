@@ -1,8 +1,13 @@
 /*
- * ICM42688 IMU + 四元数姿态解算（标准流程）
+ * ICM42688 IMU + 自适应卡尔曼滤波器
  *
  * 数据流：
- *   原始数据 → 低通滤波 → 零漂补偿 → 四元数更新 → 欧拉角
+ *   原始数据 → 零漂补偿 → 自适应卡尔曼融合 → 欧拉角
+ *
+ * 特性：
+ *   - 自适应测量噪声 R（振动检测）
+ *   - 自适应过程噪声 Q（运动检测）
+ *   - Yaw 死区抑制漂移
  *
  * 输出格式：VOFA FireWater
  *   Roll,Pitch,Yaw\n
@@ -17,7 +22,7 @@
 #include "esp_system.h"
 #include "esp_log.h"
 #include "icm42688.h"
-#include "imu_quaternion.h"
+#include "kalman.h"
 
 static const char *TAG = "main";
 
@@ -63,7 +68,7 @@ static void calibrate_gyro(void)
 static void imu_task(void *arg)
 {
     icm42688_sensor_data_t data;
-    imu_euler_t euler;
+    kalman_output_t kalman_out;
 
     // 等待系统稳定
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -82,13 +87,11 @@ static void imu_task(void *arg)
     // 零漂标定
     calibrate_gyro();
 
-    // 初始化四元数姿态解算
-    imu_quat_init();
-    imu_quat_set_drift(s_gyro_offset_x, s_gyro_offset_y, s_gyro_offset_z);
-    imu_quat_set_filter(0.3f);  // 低通滤波系数
+    // 初始化自适应卡尔曼滤波器
+    kalman_init();
 
-    ESP_LOGI(TAG, "=== 姿态解算启动 ===");
-    ESP_LOGI(TAG, "流程: 原始数据 → 低通滤波 → 零漂补偿 → 四元数更新 → 欧拉角");
+    ESP_LOGI(TAG, "=== 自适应卡尔曼滤波器启动 ===");
+    ESP_LOGI(TAG, "特性: 自适应R(振动) + 自适应Q(运动) + Yaw死区");
     ESP_LOGI(TAG, "采样率: %d Hz", SAMPLE_RATE);
     ESP_LOGI(TAG, "输出格式: Roll,Pitch,Yaw (VOFA FireWater)");
 
@@ -102,14 +105,11 @@ static void imu_task(void *arg)
         float gy = data.gy - s_gyro_offset_y;
         float gz = data.gz - s_gyro_offset_z;
 
-        // 3. 四元数姿态解算（包含低通滤波 + 四元数更新 + 欧拉角反解）
-        imu_quat_update(data.ax, data.ay, data.az, gx, gy, gz, SAMPLE_DT_S);
+        // 3. 自适应卡尔曼滤波
+        kalman_update(gx, gy, gz, data.ax, data.ay, data.az, SAMPLE_DT_S, &kalman_out);
 
-        // 4. 获取欧拉角
-        imu_quat_get_euler(&euler);
-
-        // 5. VOFA 格式输出
-        printf("%.2f,%.2f,%.2f\n", euler.roll, euler.pitch, euler.yaw);
+        // 4. VOFA 格式输出
+        printf("%.2f,%.2f,%.2f\n", kalman_out.roll, kalman_out.pitch, kalman_out.yaw);
 
         // 精确采样率控制
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_DT_MS));
@@ -118,8 +118,7 @@ static void imu_task(void *arg)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "ESP32 ICM42688 IMU - 四元数姿态解算");
-    ESP_LOGI(TAG, "标准流程: 原始数据 → 滤波 → 四元数 → 欧拉角");
+    ESP_LOGI(TAG, "ESP32 ICM42688 IMU - 自适应卡尔曼滤波器");
 
     // 打印芯片信息
     esp_chip_info_t chip_info;
