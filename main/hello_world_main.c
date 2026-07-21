@@ -1,15 +1,11 @@
 /*
- * ICM42688 IMU + 姿态解算测试（支持互补滤波/卡尔曼滤波）
+ * ICM42688 IMU + 四元数姿态解算（标准流程）
  *
- * 滤波器选择：
- *   - 使用 menuconfig 或修改 FILTER_TYPE 宏
- *   - 0: 互补滤波 (AHRS)
- *   - 1: 卡尔曼滤波 (Kalman)
+ * 数据流：
+ *   原始数据 → 低通滤波 → 零漂补偿 → 四元数更新 → 欧拉角
  *
- * 测试模式：
- *   - 0: 正常输出
- *   - 1: 阶跃响应测试（快速翻转传感器）
- *   - 2: 振动测试（敲击传感器）
+ * 输出格式：VOFA FireWater
+ *   Roll,Pitch,Yaw\n
  */
 
 #include <stdio.h>
@@ -21,19 +17,7 @@
 #include "esp_system.h"
 #include "esp_log.h"
 #include "icm42688.h"
-#include "imu_math.h"
-
-/* ==================== 配置 ==================== */
-#define FILTER_TYPE     1       // 0=互补滤波, 1=卡尔曼滤波
-#define TEST_MODE       0       // 0=正常, 1=阶跃响应, 2=振动测试
-
-#if FILTER_TYPE == 0
-    #include "ahrs.h"
-    #define FILTER_NAME "AHRS (互补滤波)"
-#else
-    #include "kalman.h"
-    #define FILTER_NAME "Kalman (卡尔曼滤波)"
-#endif
+#include "imu_quaternion.h"
 
 static const char *TAG = "main";
 
@@ -79,12 +63,12 @@ static void calibrate_gyro(void)
 static void imu_task(void *arg)
 {
     icm42688_sensor_data_t data;
-    uint32_t tick = 0;
+    imu_euler_t euler;
 
     // 等待系统稳定
     vTaskDelay(pdMS_TO_TICKS(500));
 
-    // 初始化 ICM42688（使用默认配置）
+    // 初始化 ICM42688
     ESP_LOGI(TAG, "Initializing ICM42688...");
     if (icm42688_init(NULL) != 0) {
         ESP_LOGE(TAG, "ICM42688 init failed!");
@@ -98,67 +82,34 @@ static void imu_task(void *arg)
     // 零漂标定
     calibrate_gyro();
 
-    // 初始化滤波器
-#if FILTER_TYPE == 0
-    ahrs_init();
-    ahrs_set_null_drift(s_gyro_offset_x, s_gyro_offset_y, s_gyro_offset_z);
-#else
-    kalman_init();
-#endif
+    // 初始化四元数姿态解算
+    imu_quat_init();
+    imu_quat_set_drift(s_gyro_offset_x, s_gyro_offset_y, s_gyro_offset_z);
+    imu_quat_set_filter(0.3f);  // 低通滤波系数
 
     ESP_LOGI(TAG, "=== 姿态解算启动 ===");
-    ESP_LOGI(TAG, "滤波器: %s", FILTER_NAME);
+    ESP_LOGI(TAG, "流程: 原始数据 → 低通滤波 → 零漂补偿 → 四元数更新 → 欧拉角");
     ESP_LOGI(TAG, "采样率: %d Hz", SAMPLE_RATE);
-    ESP_LOGI(TAG, "测试模式: %d", TEST_MODE);
-    ESP_LOGI(TAG, "----------------------------------------------------------------");
-
-#if TEST_MODE == 1
-    ESP_LOGI(TAG, "【阶跃响应测试】快速翻转传感器，观察响应速度");
-#elif TEST_MODE == 2
-    ESP_LOGI(TAG, "【振动测试】敲击传感器，观察抗振能力");
-#endif
-
-#if FILTER_TYPE == 0
-    ESP_LOGI(TAG, "  Tick  Roll(X)   Pitch(Y)   Yaw(Z)   Vibration  Gyro(dps)");
-#else
-    ESP_LOGI(TAG, "  Tick  Roll(X)   Pitch(Y)   Yaw(Z)   Gyro(dps)");
-#endif
-    ESP_LOGI(TAG, "----------------------------------------------------------------");
+    ESP_LOGI(TAG, "输出格式: Roll,Pitch,Yaw (VOFA FireWater)");
 
     // 主循环
     while (1) {
-        // 读取传感器数据
+        // 1. 读取原始数据
         icm42688_get_all_data(&data);
 
-        // 零漂补偿
+        // 2. 零漂补偿
         float gx = data.gx - s_gyro_offset_x;
         float gy = data.gy - s_gyro_offset_y;
         float gz = data.gz - s_gyro_offset_z;
 
-#if FILTER_TYPE == 0
-        /* 互补滤波模式 */
-        ahrs_update();
-        ahrs_state_t state;
-        ahrs_get_state(&state);
+        // 3. 四元数姿态解算（包含低通滤波 + 四元数更新 + 欧拉角反解）
+        imu_quat_update(data.ax, data.ay, data.az, gx, gy, gz, SAMPLE_DT_S);
 
-        // VOFA 格式输出: Roll,Pitch,Yaw\n
-        printf("%.2f,%.2f,%.2f\n",
-               (double)state.euler.roll,
-               (double)state.euler.pitch,
-               (double)state.euler.yaw);
-#else
-        /* 卡尔曼滤波模式 */
-        kalman_output_t kalman_out;
-        kalman_update(gx, gy, gz, data.ax, data.ay, data.az, SAMPLE_DT_S, &kalman_out);
+        // 4. 获取欧拉角
+        imu_quat_get_euler(&euler);
 
-        // VOFA 格式输出: Roll,Pitch,Yaw\n
-        printf("%.2f,%.2f,%.2f\n",
-               (double)kalman_out.roll,
-               (double)kalman_out.pitch,
-               (double)kalman_out.yaw);
-#endif
-
-        tick++;
+        // 5. VOFA 格式输出
+        printf("%.2f,%.2f,%.2f\n", euler.roll, euler.pitch, euler.yaw);
 
         // 精确采样率控制
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_DT_MS));
@@ -167,8 +118,8 @@ static void imu_task(void *arg)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "ESP32 ICM42688 IMU Attitude Estimation");
-    ESP_LOGI(TAG, "Filter: %s, Test Mode: %d", FILTER_NAME, TEST_MODE);
+    ESP_LOGI(TAG, "ESP32 ICM42688 IMU - 四元数姿态解算");
+    ESP_LOGI(TAG, "标准流程: 原始数据 → 滤波 → 四元数 → 欧拉角");
 
     // 打印芯片信息
     esp_chip_info_t chip_info;
