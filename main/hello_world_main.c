@@ -141,27 +141,21 @@ static void imu_task(void *arg)
         ahrs_state_t state;
         ahrs_get_state(&state);
 
-        ESP_LOGI(TAG, "  %"PRIu32"  %+7.2f  %+7.2f  %+7.2f    %.2f    %.1f %.1f %.1f",
-                 tick,
-                 (double)state.euler.roll, (double)state.euler.pitch, (double)state.euler.yaw,
-                 (double)state.vibration_weight,
-                 (double)state.gyro_x, (double)state.gyro_y, (double)state.gyro_z);
+        // VOFA 格式输出: Roll,Pitch,Yaw\n
+        printf("%.2f,%.2f,%.2f\n",
+               (double)state.euler.roll,
+               (double)state.euler.pitch,
+               (double)state.euler.yaw);
 #else
         /* 卡尔曼滤波模式 */
         kalman_output_t kalman_out;
         kalman_update(gx, gy, gz, data.ax, data.ay, data.az, SAMPLE_DT_S, &kalman_out);
 
-        // 显示自适应参数（每 50 帧显示一次详细信息）
-        if (tick % 50 == 0) {
-            ESP_LOGI(TAG, "  [自适应] R=%.4f Q=%.4f Vibration=%.2f Motion=%.2f",
-                     (double)kalman_out.adaptive_R, (double)kalman_out.adaptive_Q,
-                     (double)kalman_out.vibration_weight, (double)kalman_out.motion_weight);
-        }
-
-        ESP_LOGI(TAG, "  %"PRIu32"  %+7.2f  %+7.2f  %+7.2f    %.1f %.1f %.1f",
-                 tick,
-                 (double)kalman_out.roll, (double)kalman_out.pitch, (double)kalman_out.yaw,
-                 (double)gx, (double)gy, (double)gz);
+        // VOFA 格式输出: Roll,Pitch,Yaw\n
+        printf("%.2f,%.2f,%.2f\n",
+               (double)kalman_out.roll,
+               (double)kalman_out.pitch,
+               (double)kalman_out.yaw);
 #endif
 
         tick++;
