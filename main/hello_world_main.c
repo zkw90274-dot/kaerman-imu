@@ -6,11 +6,10 @@
  *   - 0: 互补滤波 (AHRS)
  *   - 1: 卡尔曼滤波 (Kalman)
  *
- * 优化特性：
- *   - 硬件 SPI 驱动 (10MHz)
- *   - 陀螺仪零漂自动标定
- *   - 误差积分限幅 / 振动自适应 / Yaw 死区 (互补滤波)
- *   - 自定义数学函数 (不依赖 math.h)
+ * 测试模式：
+ *   - 0: 正常输出
+ *   - 1: 阶跃响应测试（快速翻转传感器）
+ *   - 2: 振动测试（敲击传感器）
  */
 
 #include <stdio.h>
@@ -24,9 +23,9 @@
 #include "icm42688.h"
 #include "imu_math.h"
 
-/* ==================== 滤波器选择 ==================== */
-/* 修改此宏选择滤波器: 0=互补滤波, 1=卡尔曼滤波 */
-#define FILTER_TYPE     1
+/* ==================== 配置 ==================== */
+#define FILTER_TYPE     1       // 0=互补滤波, 1=卡尔曼滤波
+#define TEST_MODE       0       // 0=正常, 1=阶跃响应, 2=振动测试
 
 #if FILTER_TYPE == 0
     #include "ahrs.h"
@@ -47,7 +46,6 @@ static const char *TAG = "main";
 #define CALIBRATE_COUNT 500
 
 static float s_gyro_offset_x = 0, s_gyro_offset_y = 0, s_gyro_offset_z = 0;
-static uint8_t s_calibrated = 0;
 
 /**
  * @brief   陀螺仪零漂标定
@@ -70,7 +68,6 @@ static void calibrate_gyro(void)
     s_gyro_offset_x = sum_x / CALIBRATE_COUNT;
     s_gyro_offset_y = sum_y / CALIBRATE_COUNT;
     s_gyro_offset_z = sum_z / CALIBRATE_COUNT;
-    s_calibrated = 1;
 
     ESP_LOGI(TAG, "零漂标定完成: X=%.4f, Y=%.4f, Z=%.4f °/s",
              (double)s_gyro_offset_x, (double)s_gyro_offset_y, (double)s_gyro_offset_z);
@@ -82,6 +79,7 @@ static void calibrate_gyro(void)
 static void imu_task(void *arg)
 {
     icm42688_sensor_data_t data;
+    uint32_t tick = 0;
 
     // 等待系统稳定
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -103,7 +101,6 @@ static void imu_task(void *arg)
     // 初始化滤波器
 #if FILTER_TYPE == 0
     ahrs_init();
-    // 设置零漂到 AHRS
     ahrs_set_null_drift(s_gyro_offset_x, s_gyro_offset_y, s_gyro_offset_z);
 #else
     kalman_init();
@@ -112,12 +109,19 @@ static void imu_task(void *arg)
     ESP_LOGI(TAG, "=== 姿态解算启动 ===");
     ESP_LOGI(TAG, "滤波器: %s", FILTER_NAME);
     ESP_LOGI(TAG, "采样率: %d Hz", SAMPLE_RATE);
+    ESP_LOGI(TAG, "测试模式: %d", TEST_MODE);
     ESP_LOGI(TAG, "----------------------------------------------------------------");
 
+#if TEST_MODE == 1
+    ESP_LOGI(TAG, "【阶跃响应测试】快速翻转传感器，观察响应速度");
+#elif TEST_MODE == 2
+    ESP_LOGI(TAG, "【振动测试】敲击传感器，观察抗振能力");
+#endif
+
 #if FILTER_TYPE == 0
-    ESP_LOGI(TAG, "  Roll(X)   Pitch(Y)   Yaw(Z)   Vibration  Gyro(dps)");
+    ESP_LOGI(TAG, "  Tick  Roll(X)   Pitch(Y)   Yaw(Z)   Vibration  Gyro(dps)");
 #else
-    ESP_LOGI(TAG, "  Roll(X)   Pitch(Y)   Yaw(Z)   Gyro(dps)");
+    ESP_LOGI(TAG, "  Tick  Roll(X)   Pitch(Y)   Yaw(Z)   Gyro(dps)");
 #endif
     ESP_LOGI(TAG, "----------------------------------------------------------------");
 
@@ -133,12 +137,12 @@ static void imu_task(void *arg)
 
 #if FILTER_TYPE == 0
         /* 互补滤波模式 */
-        // AHRS 内部会读取传感器并处理零漂
         ahrs_update();
         ahrs_state_t state;
         ahrs_get_state(&state);
 
-        ESP_LOGI(TAG, "  %+7.2f  %+7.2f  %+7.2f    %.2f    %.1f %.1f %.1f",
+        ESP_LOGI(TAG, "  %"PRIu32"  %+7.2f  %+7.2f  %+7.2f    %.2f    %.1f %.1f %.1f",
+                 tick,
                  (double)state.euler.roll, (double)state.euler.pitch, (double)state.euler.yaw,
                  (double)state.vibration_weight,
                  (double)state.gyro_x, (double)state.gyro_y, (double)state.gyro_z);
@@ -147,10 +151,20 @@ static void imu_task(void *arg)
         kalman_output_t kalman_out;
         kalman_update(gx, gy, gz, data.ax, data.ay, data.az, SAMPLE_DT_S, &kalman_out);
 
-        ESP_LOGI(TAG, "  %+7.2f  %+7.2f  %+7.2f    %.1f %.1f %.1f",
+        // 显示自适应参数（每 50 帧显示一次详细信息）
+        if (tick % 50 == 0) {
+            ESP_LOGI(TAG, "  [自适应] R=%.4f Q=%.4f Vibration=%.2f Motion=%.2f",
+                     (double)kalman_out.adaptive_R, (double)kalman_out.adaptive_Q,
+                     (double)kalman_out.vibration_weight, (double)kalman_out.motion_weight);
+        }
+
+        ESP_LOGI(TAG, "  %"PRIu32"  %+7.2f  %+7.2f  %+7.2f    %.1f %.1f %.1f",
+                 tick,
                  (double)kalman_out.roll, (double)kalman_out.pitch, (double)kalman_out.yaw,
                  (double)gx, (double)gy, (double)gz);
 #endif
+
+        tick++;
 
         // 精确采样率控制
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_DT_MS));
@@ -160,7 +174,7 @@ static void imu_task(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "ESP32 ICM42688 IMU Attitude Estimation");
-    ESP_LOGI(TAG, "Filter: %s", FILTER_NAME);
+    ESP_LOGI(TAG, "Filter: %s, Test Mode: %d", FILTER_NAME, TEST_MODE);
 
     // 打印芯片信息
     esp_chip_info_t chip_info;

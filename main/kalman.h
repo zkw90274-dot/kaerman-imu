@@ -51,6 +51,10 @@ typedef struct {
     float yaw;              // 偏航角（度，陀螺仪积分）
     float roll_rate;        // 横滚角速度（度/秒）
     float pitch_rate;       // 俯仰角速度（度/秒）
+    float vibration_weight; // 振动权重 (1.0=无振动, >1.0=有振动)
+    float motion_weight;    // 运动权重 (1.0=静止, >1.0=运动)
+    float adaptive_R;       // 当前自适应 R 值
+    float adaptive_Q;       // 当前自适应 Q 值
 } kalman_output_t;
 
 /* ==================== API 函数 ==================== */
