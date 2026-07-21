@@ -1,53 +1,64 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 | ESP32-P4 | ESP32-S2 | ESP32-S3 | Linux |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | -------- | -------- | -------- | ----- |
+# kaerman — ESP32 IMU 姿态解算系统
 
-# Hello World Example
+基于 ESP32-S3 + ICM-42688-P 六轴传感器的双滤波器姿态解算系统。
 
-Starts a FreeRTOS task to print "Hello World".
+## 功能
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+- **双滤波器并行运行**：自适应卡尔曼 + Mahony 互补滤波
+- **四元数输出** → ZYX 欧拉角（Roll, Pitch, Yaw）
+- **自适应参数**：振动检测调整 R/Kp，运动检测调整 Q
+- **Yaw 死区**：0.5 dps 以下不积分，抑制漂移
+- **Mahony 加速度计初始化**：首帧即准确，无需收敛
+- **VOFA 上位机输出**：FireWater 协议
 
-## How to use example
+## 硬件
 
-Follow detailed instructions provided specifically for this example.
+| 功能 | GPIO |
+|------|------|
+| SPI_SCLK | 12 |
+| SPI_MOSI | 11 |
+| SPI_MISO | 10 |
+| SPI_CS | 9 |
 
-Select the instructions depending on Espressif chip installed on your development board:
+目标芯片：ESP32-S3
 
-- [ESP32 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/stable/get-started/index.html)
-- [ESP32-S2 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/get-started/index.html)
+## 构建与烧录
 
+需要 [ESP-IDF v5.4.3](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/get-started/index.html) 环境。
 
-## Example folder contents
-
-The project **hello_world** contains one source file in C language [hello_world_main.c](main/hello_world_main.c). The file is located in folder [main](main).
-
-ESP-IDF projects are built using CMake. The project build configuration is contained in `CMakeLists.txt` files that provide set of directives and instructions describing the project's source files and targets (executable, library, or both).
-
-Below is short explanation of remaining files in the project folder.
-
-```
-├── CMakeLists.txt
-├── pytest_hello_world.py      Python script used for automated testing
-├── main
-│   ├── CMakeLists.txt
-│   └── hello_world_main.c
-└── README.md                  This is the file you are currently reading
+```bash
+idf.py set-target esp32s3
+idf.py build
+idf.py -p COM18 flash monitor
 ```
 
-For more information on structure and contents of ESP-IDF projects, please refer to Section [Build System](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/build-system.html) of the ESP-IDF Programming Guide.
+## 串口输出格式
 
-## Troubleshooting
+```
+K:roll,pitch,yaw,M:roll,pitch,yaw
+```
 
-* Program upload failure
+- `K:` — 卡尔曼滤波输出
+- `M:` — Mahony 滤波输出
 
-    * Hardware connection is not correct: run `idf.py -p PORT monitor`, and reboot your board to see if there are any output logs.
-    * The baud rate for downloading is too high: lower your baud rate in the `menuconfig` menu, and try again.
+## 项目结构
 
-## Technical support and feedback
+```
+main/
+├── hello_world_main.c   # 应用入口，双滤波器主循环
+├── hw_spi.c/h           # ESP32 硬件 SPI 驱动
+├── icm42688.c/h         # ICM-42688-P 传感器驱动
+├── imu_math.c/h         # 数学函数 + 四元数工具（无 math.h 依赖）
+├── kalman.c/h           # 自适应卡尔曼滤波器
+└── ahrs.c/h             # Mahony 互补滤波器
+```
 
-Please use the following feedback channels:
+## 依赖
 
-* For technical queries, go to the [esp32.com](https://esp32.com/) forum
-* For a feature request or bug report, create a [GitHub issue](https://github.com/espressif/esp-idf/issues)
+- ESP-IDF v5.4.3
+- FreeRTOS（ESP-IDF 内置）
 
-We will get back to you as soon as possible.
+## 参考
+
+- [ICM-42688-P Datasheet](https://invensense.tdk.com/wp-content/uploads/2020/11/ds-000347-icm-42688-p-datasheet.pdf)
+- [VOFA+ 上位机](https://vofa.plus/)
