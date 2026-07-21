@@ -1,14 +1,13 @@
 /**
  * @file    icm42688.c
- * @brief   ICM42688 六轴 IMU 驱动实现（硬件 SPI）
+ * @brief   ICM-42688-P 六轴 IMU 驱动实现（硬件 SPI）
  * @author  Claude
  * @date    2026-07-21
  * @version 2.0.0
  *
  * @details
- * 使用 ESP-IDF 硬件 SPI 驱动
- * SPI 读操作：发送寄存器地址 | 0x80，然后读取数据
- * SPI 写操作：发送寄存器地址 & 0x7F，然后发送数据
+ * 基于 ICM-42688-P Datasheet (DS-000347, Rev 1.2) 完善
+ * 支持完整的初始化流程、滤波器配置、中断配置
  */
 
 #include "icm42688.h"
@@ -22,26 +21,200 @@ static const char *TAG = "icm42688";
 /* ==================== 私有变量 ==================== */
 
 static hw_spi_t s_spi;                     // 硬件 SPI 句柄
-static float s_acc_sensitivity  = 0.244f;  // 加速度计灵敏度 (mg/LSB)
-static float s_gyro_sensitivity = 32.8f;   // 陀螺仪灵敏度 (dps/LSB)
+static icm42688_config_t s_config;         // 当前配置
+static float s_acc_sensitivity = 1.0f;     // 加速度计灵敏度 (g/LSB)
+static float s_gyro_sensitivity = 1.0f;    // 陀螺仪灵敏度 (dps/LSB)
+
+/* ==================== 灵敏度查找表 ==================== */
+
+/* 陀螺仪灵敏度表 (LSB/dps) */
+static const float gyro_sensitivity_table[8] = {
+    16.4f,      // ICM42688_GYRO_FS_2000DPS
+    32.8f,      // ICM42688_GYRO_FS_1000DPS
+    65.5f,      // ICM42688_GYRO_FS_500DPS
+    131.0f,     // ICM42688_GYRO_FS_250DPS
+    262.0f,     // ICM42688_GYRO_FS_125DPS
+    524.3f,     // ICM42688_GYRO_FS_62_5DPS
+    1048.6f,    // ICM42688_GYRO_FS_31_25DPS
+    2097.2f     // ICM42688_GYRO_FS_15_625DPS
+};
+
+/* 加速度计灵敏度表 (LSB/g) */
+static const float accel_sensitivity_table[4] = {
+    2048.0f,    // ICM42688_ACCEL_FS_16G
+    4096.0f,    // ICM42688_ACCEL_FS_8G
+    8192.0f,    // ICM42688_ACCEL_FS_4G
+    16384.0f    // ICM42688_ACCEL_FS_2G
+};
+
+/* ==================== 内部函数 ==================== */
+
+/**
+ * @brief   写入单个寄存器
+ */
+static void icm42688_write_reg(uint8_t reg, uint8_t value)
+{
+    hw_spi_write_reg(&s_spi, reg, value);
+}
+
+/**
+ * @brief   读取单个寄存器
+ */
+static uint8_t icm42688_read_reg(uint8_t reg)
+{
+    return hw_spi_read_reg(&s_spi, reg);
+}
+
+/**
+ * @brief   读取多个连续寄存器
+ */
+static void icm42688_read_regs(uint8_t reg, uint8_t *buf, uint16_t len)
+{
+    hw_spi_read_regs(&s_spi, reg, buf, len);
+}
+
+/**
+ * @brief   更新灵敏度
+ */
+static void icm42688_update_sensitivity(void)
+{
+    if (s_config.gyro_fs < 8) {
+        s_gyro_sensitivity = 1.0f / gyro_sensitivity_table[s_config.gyro_fs];
+    }
+    if (s_config.accel_fs < 4) {
+        s_acc_sensitivity = 1.0f / accel_sensitivity_table[s_config.accel_fs];
+    }
+}
+
+/**
+ * @brief   等待复位完成
+ */
+static int8_t icm42688_wait_reset_done(void)
+{
+    uint32_t timeout = 100;  // 100ms 超时
+    uint8_t int_status;
+
+    while (timeout > 0) {
+        int_status = icm42688_read_reg(ICM42688_REG_INT_STATUS);
+        if (int_status & ICM42688_INT_STATUS_RESET_DONE) {
+            return 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+        timeout--;
+    }
+
+    ESP_LOGE(TAG, "Reset timeout!");
+    return -1;
+}
 
 /* ==================== 公共 API 实现 ==================== */
+
+/**
+ * @brief   切换寄存器 Bank
+ */
+int8_t icm42688_select_bank(uint8_t bank)
+{
+    if (bank > 4) {
+        return -1;
+    }
+    icm42688_write_reg(ICM42688_REG_REG_BANK_SEL, bank);
+    return 0;
+}
 
 /**
  * @brief   读取 WHO_AM_I 寄存器
  */
 uint8_t icm42688_read_id(void)
 {
-    return hw_spi_read_reg(&s_spi, ICM42688_WHO_AM_I);
+    return icm42688_read_reg(ICM42688_REG_WHO_AM_I);
+}
+
+/**
+ * @brief   软复位
+ */
+int8_t icm42688_reset(void)
+{
+    ESP_LOGI(TAG, "Performing soft reset...");
+
+    // 触发软复位
+    icm42688_write_reg(ICM42688_REG_DEVICE_CONFIG, 0x01);
+
+    // 等待复位完成
+    vTaskDelay(pdMS_TO_TICKS(10));
+    return icm42688_wait_reset_done();
+}
+
+/**
+ * @brief   自检
+ */
+int8_t icm42688_self_test(void)
+{
+    uint8_t whoami = icm42688_read_id();
+
+    if (whoami != ICM42688_WHO_AM_I_VAL) {
+        ESP_LOGE(TAG, "Self test failed: WHO_AM_I = 0x%02X (expected 0x%02X)",
+                 whoami, ICM42688_WHO_AM_I_VAL);
+        return -1;
+    }
+
+    ESP_LOGI(TAG, "Self test passed: WHO_AM_I = 0x%02X", whoami);
+    return 0;
+}
+
+/**
+ * @brief   读取中断状态
+ */
+uint8_t icm42688_read_int_status(void)
+{
+    return icm42688_read_reg(ICM42688_REG_INT_STATUS);
+}
+
+/**
+ * @brief   配置中断
+ */
+int8_t icm42688_config_interrupt(uint8_t int_source)
+{
+    // 配置 INT1 为推挽输出，低电平有效
+    icm42688_write_reg(ICM42688_REG_INT_CONFIG, 0x00);
+
+    // 配置中断脉冲
+    icm42688_write_reg(ICM42688_REG_INT_CONFIG1, 0x00);
+
+    // 使能数据就绪中断到 INT1
+    icm42688_write_reg(ICM42688_REG_INT_SOURCE0, int_source);
+
+    ESP_LOGI(TAG, "Interrupt configured: source=0x%02X", int_source);
+    return 0;
+}
+
+/**
+ * @brief   获取当前配置
+ */
+void icm42688_get_config(icm42688_config_t *config)
+{
+    if (config != NULL) {
+        *config = s_config;
+    }
 }
 
 /**
  * @brief   初始化 ICM42688
  */
-int8_t icm42688_init(void)
+int8_t icm42688_init(const icm42688_config_t *config)
 {
-    uint8_t reg_val;
     uint8_t device_id;
+
+    ESP_LOGI(TAG, "=== 初始化 ICM-42688-P ===");
+
+    // 使用默认配置或用户配置
+    if (config != NULL) {
+        s_config = *config;
+    } else {
+        s_config.gyro_fs = ICM42688_GYRO_FS_1000DPS;
+        s_config.accel_fs = ICM42688_ACCEL_FS_2G;
+        s_config.gyro_odr = ICM42688_ODR_200HZ;
+        s_config.accel_odr = ICM42688_ODR_200HZ;
+    }
 
     // 初始化硬件 SPI
     hw_spi_config_t spi_cfg = HW_SPI_DEFAULT_CONFIG;
@@ -50,63 +223,55 @@ int8_t icm42688_init(void)
         return -1;
     }
 
-    // 等待传感器上电
-    vTaskDelay(pdMS_TO_TICKS(50));
-
-    // 软复位
-    hw_spi_write_reg(&s_spi, ICM42688_DEVICE_CONFIG, 0x01);
+    // 等待传感器上电稳定
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // 读取设备 ID
-    device_id = hw_spi_read_reg(&s_spi, ICM42688_WHO_AM_I);
-    ESP_LOGI(TAG, "WHO_AM_I = 0x%02X", device_id);
-
-    if (device_id != ICM42688_ID) {
-        ESP_LOGE(TAG, "Device ID mismatch! Expected 0x%02X, got 0x%02X",
-                 ICM42688_ID, device_id);
+    // 软复位
+    if (icm42688_reset() != 0) {
+        ESP_LOGE(TAG, "Reset failed");
         return -1;
     }
 
-    // 配置加速度计：±2g，200Hz
-    s_acc_sensitivity = 2000.0f / 32768.0f;
-    reg_val = hw_spi_read_reg(&s_spi, ICM42688_ACCEL_CONFIG0);
-    reg_val &= ~((0x3 << 5) | 0x0F);
-    reg_val |= (AFS_2G << 5);
-    reg_val |= AODR_200Hz;
-    hw_spi_write_reg(&s_spi, ICM42688_ACCEL_CONFIG0, reg_val);
+    // 自检（读取 WHO_AM_I）
+    if (icm42688_self_test() != 0) {
+        return -1;
+    }
 
-    // 配置陀螺仪：±1000dps，200Hz
-    s_gyro_sensitivity = 1000.0f / 32768.0f;
-    reg_val = hw_spi_read_reg(&s_spi, ICM42688_GYRO_CONFIG0);
-    reg_val &= ~((0x3 << 5) | 0x0F);
-    reg_val |= (GFS_1000DPS << 5);
-    reg_val |= GODR_200Hz;
-    hw_spi_write_reg(&s_spi, ICM42688_GYRO_CONFIG0, reg_val);
+    // 确保在 Bank 0
+    icm42688_select_bank(0);
 
-    // 配置加速度计滤波器（Bank 2）
-    hw_spi_write_reg(&s_spi, ICM42688_REG_BANK_SEL, 0x02);
-    reg_val = hw_spi_read_reg(&s_spi, ICM42688_ACCEL_CONFIG_STATIC3);
-    reg_val = (reg_val & ~0x70) | (AAVG_4X << 4);
-    reg_val = (reg_val & ~0x0F) | AAF_1_16_ODR;
-    hw_spi_write_reg(&s_spi, ICM42688_ACCEL_CONFIG_STATIC3, reg_val);
+    // 配置陀螺仪：量程 + ODR
+    uint8_t gyro_config0 = (s_config.gyro_fs << 5) | s_config.gyro_odr;
+    icm42688_write_reg(ICM42688_REG_GYRO_CONFIG0, gyro_config0);
+    ESP_LOGI(TAG, "Gyro config: FS=%d, ODR=0x%02X", s_config.gyro_fs, s_config.gyro_odr);
 
-    // 配置陀螺仪滤波器（Bank 1）
-    hw_spi_write_reg(&s_spi, ICM42688_REG_BANK_SEL, 0x01);
-    reg_val = hw_spi_read_reg(&s_spi, ICM42688_GYRO_CONFIG_STATIC3);
-    reg_val = (reg_val & ~0x70) | (GAVG_4X << 4);
-    reg_val = (reg_val & ~0x0F) | GF_1_16_ODR;
-    hw_spi_write_reg(&s_spi, ICM42688_GYRO_CONFIG_STATIC3, reg_val);
+    // 配置加速度计：量程 + ODR
+    uint8_t accel_config0 = (s_config.accel_fs << 5) | s_config.accel_odr;
+    icm42688_write_reg(ICM42688_REG_ACCEL_CONFIG0, accel_config0);
+    ESP_LOGI(TAG, "Accel config: FS=%d, ODR=0x%02X", s_config.accel_fs, s_config.accel_odr);
 
-    // 切换回 Bank 0，启动传感器
-    hw_spi_write_reg(&s_spi, ICM42688_REG_BANK_SEL, 0x00);
-    reg_val = hw_spi_read_reg(&s_spi, ICM42688_PWR_MGMT0);
-    reg_val &= ~(1 << 5);      // 清除 GYRO_STANDBY
-    reg_val |= (3 << 2);       // 加速度计低噪声模式
-    reg_val |= 3;              // 陀螺仪低噪声模式
-    hw_spi_write_reg(&s_spi, ICM42688_PWR_MGMT0, reg_val);
-    vTaskDelay(pdMS_TO_TICKS(1));
+    // 配置滤波器（可选）
+    // Gyro UI filter: BW = ODR/4
+    icm42688_write_reg(ICM42688_REG_GYRO_CONFIG1, 0x16);  // 2阶滤波器
+    icm42688_write_reg(ICM42688_REG_GYRO_ACCEL_CONFIG0, 0x11);  // BW = ODR/4
 
-    ESP_LOGI(TAG, "ICM42688 initialized (HW SPI)");
+    // 使能 6 轴低噪声模式
+    uint8_t pwr_mgmt0 = ICM42688_PWR_MGMT0_GYRO_MODE_LN | ICM42688_PWR_MGMT0_ACCEL_MODE_LN;
+    icm42688_write_reg(ICM42688_REG_PWR_MGMT0, pwr_mgmt0);
+
+    // 等待陀螺仪启动（至少 45ms）
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // 配置数据就绪中断
+    icm42688_config_interrupt(ICM42688_INT_STATUS_DATA_RDY);
+
+    // 更新灵敏度
+    icm42688_update_sensitivity();
+
+    ESP_LOGI(TAG, "ICM-42688-P 初始化完成");
+    ESP_LOGI(TAG, "  Gyro sensitivity: %.4f dps/LSB", (double)(1.0f / s_gyro_sensitivity));
+    ESP_LOGI(TAG, "  Accel sensitivity: %.4f g/LSB", (double)(1.0f / s_acc_sensitivity));
+
     return 0;
 }
 
@@ -118,8 +283,10 @@ int8_t icm42688_get_temperature(float *temperature)
     uint8_t buffer[2];
     int16_t raw_temp;
 
-    hw_spi_read_regs(&s_spi, ICM42688_TEMP_DATA1, buffer, 2);
+    icm42688_read_regs(ICM42688_REG_TEMP_DATA1, buffer, 2);
     raw_temp = (int16_t)((buffer[0] << 8) | buffer[1]);
+
+    // 温度转换公式：TEMP(°C) = TEMP_DATA / 132.48 + 25
     *temperature = (float)raw_temp / 132.48f + 25.0f;
 
     return 0;
@@ -134,7 +301,7 @@ int8_t icm42688_get_accelerometer(icm42688_raw_data_t *raw,
     uint8_t buffer[6];
     int16_t raw_x, raw_y, raw_z;
 
-    hw_spi_read_regs(&s_spi, ICM42688_ACCEL_DATA_X1, buffer, 6);
+    icm42688_read_regs(ICM42688_REG_ACCEL_DATA_X1, buffer, 6);
 
     raw_x = (int16_t)((buffer[0] << 8) | buffer[1]);
     raw_y = (int16_t)((buffer[2] << 8) | buffer[3]);
@@ -146,9 +313,9 @@ int8_t icm42688_get_accelerometer(icm42688_raw_data_t *raw,
         raw->z = raw_z;
     }
 
-    if (ax != NULL) *ax = (float)raw_x * s_acc_sensitivity / 1000.0f;
-    if (ay != NULL) *ay = (float)raw_y * s_acc_sensitivity / 1000.0f;
-    if (az != NULL) *az = (float)raw_z * s_acc_sensitivity / 1000.0f;
+    if (ax != NULL) *ax = (float)raw_x * s_acc_sensitivity;
+    if (ay != NULL) *ay = (float)raw_y * s_acc_sensitivity;
+    if (az != NULL) *az = (float)raw_z * s_acc_sensitivity;
 
     return 0;
 }
@@ -162,7 +329,7 @@ int8_t icm42688_get_gyroscope(icm42688_raw_data_t *raw,
     uint8_t buffer[6];
     int16_t raw_x, raw_y, raw_z;
 
-    hw_spi_read_regs(&s_spi, ICM42688_GYRO_DATA_X1, buffer, 6);
+    icm42688_read_regs(ICM42688_REG_GYRO_DATA_X1, buffer, 6);
 
     raw_x = (int16_t)((buffer[0] << 8) | buffer[1]);
     raw_y = (int16_t)((buffer[2] << 8) | buffer[3]);
@@ -194,7 +361,8 @@ int8_t icm42688_get_all_data(icm42688_sensor_data_t *data)
     }
 
     // 从 TEMP_DATA1 开始连续读取 14 字节
-    hw_spi_read_regs(&s_spi, ICM42688_TEMP_DATA1, buffer, 14);
+    // 温度(2) + 加速度计(6) + 陀螺仪(6)
+    icm42688_read_regs(ICM42688_REG_TEMP_DATA1, buffer, 14);
 
     raw_temp = (int16_t)((buffer[0] << 8) | buffer[1]);
     raw_ax   = (int16_t)((buffer[2] << 8) | buffer[3]);
@@ -204,10 +372,11 @@ int8_t icm42688_get_all_data(icm42688_sensor_data_t *data)
     raw_gy   = (int16_t)((buffer[10] << 8) | buffer[11]);
     raw_gz   = (int16_t)((buffer[12] << 8) | buffer[13]);
 
+    // 转换为物理单位
     data->temperature = (float)raw_temp / 132.48f + 25.0f;
-    data->ax = (float)raw_ax * s_acc_sensitivity / 1000.0f;
-    data->ay = (float)raw_ay * s_acc_sensitivity / 1000.0f;
-    data->az = (float)raw_az * s_acc_sensitivity / 1000.0f;
+    data->ax = (float)raw_ax * s_acc_sensitivity;
+    data->ay = (float)raw_ay * s_acc_sensitivity;
+    data->az = (float)raw_az * s_acc_sensitivity;
     data->gx = (float)raw_gx * s_gyro_sensitivity;
     data->gy = (float)raw_gy * s_gyro_sensitivity;
     data->gz = (float)raw_gz * s_gyro_sensitivity;

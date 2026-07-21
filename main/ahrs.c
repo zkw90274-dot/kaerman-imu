@@ -81,7 +81,7 @@ void ahrs_init(void)
     ESP_LOGI(TAG, "=== 初始化 AHRS ===");
 
     // 初始化 ICM42688
-    if (icm42688_init() != 0) {
+    if (icm42688_init(NULL) != 0) {
         ESP_LOGE(TAG, "ICM42688 init failed!");
         return;
     }

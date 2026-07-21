@@ -84,9 +84,9 @@ static void imu_task(void *arg)
     // 等待系统稳定
     vTaskDelay(pdMS_TO_TICKS(500));
 
-    // 初始化 ICM42688
+    // 初始化 ICM42688（使用默认配置）
     ESP_LOGI(TAG, "Initializing ICM42688...");
-    if (icm42688_init() != 0) {
+    if (icm42688_init(NULL) != 0) {
         ESP_LOGE(TAG, "ICM42688 init failed!");
         vTaskDelete(NULL);
         return;
