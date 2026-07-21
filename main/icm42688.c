@@ -199,12 +199,24 @@ void icm42688_get_config(icm42688_config_t *config)
 
 /**
  * @brief   初始化 ICM42688
+ * @details 按照官方 datasheet 推荐流程：
+ *          1. 等待上电稳定 (100ms)
+ *          2. 读取 WHO_AM_I 验证通信 (期望 0x47)
+ *          3. 软复位 + 等待复位完成
+ *          4. 配置陀螺仪量程和 ODR
+ *          5. 配置加速度计量程和 ODR
+ *          6. 配置 UI 滤波器带宽
+ *          7. 配置中断 (数据就绪 → INT1)
+ *          8. 使能 6轴低噪声模式
+ *          9. 等待陀螺仪启动 (50ms)
+ *          10. 传感器自检
  */
 int8_t icm42688_init(const icm42688_config_t *config)
 {
     uint8_t device_id;
 
     ESP_LOGI(TAG, "=== 初始化 ICM-42688-P ===");
+    ESP_LOGI(TAG, "按照官方 datasheet 推荐流程...");
 
     // 使用默认配置或用户配置
     if (config != NULL) {
@@ -223,52 +235,91 @@ int8_t icm42688_init(const icm42688_config_t *config)
         return -1;
     }
 
-    // 等待传感器上电稳定
+    // ========== 步骤 1: 等待上电稳定 (100ms) ==========
+    ESP_LOGI(TAG, "[1/10] 等待上电稳定...");
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // 软复位
-    if (icm42688_reset() != 0) {
-        ESP_LOGE(TAG, "Reset failed");
+    // ========== 步骤 2: 读取 WHO_AM_I 验证通信 ==========
+    ESP_LOGI(TAG, "[2/10] 读取 WHO_AM_I 验证通信...");
+    device_id = icm42688_read_reg(ICM42688_REG_WHO_AM_I);
+    if (device_id != ICM42688_WHO_AM_I_VAL) {
+        ESP_LOGE(TAG, "WHO_AM_I 校验失败! 读取=0x%02X, 期望=0x%02X",
+                 device_id, ICM42688_WHO_AM_I_VAL);
         return -1;
     }
+    ESP_LOGI(TAG, "  WHO_AM_I = 0x%02X ✓", device_id);
 
-    // 自检（读取 WHO_AM_I）
-    if (icm42688_self_test() != 0) {
+    // ========== 步骤 3: 软复位 + 等待复位完成 ==========
+    ESP_LOGI(TAG, "[3/10] 软复位...");
+    if (icm42688_reset() != 0) {
+        ESP_LOGE(TAG, "软复位失败!");
         return -1;
     }
+    ESP_LOGI(TAG, "  复位完成 ✓");
 
     // 确保在 Bank 0
     icm42688_select_bank(0);
 
-    // 配置陀螺仪：量程 + ODR
+    // ========== 步骤 4: 配置陀螺仪量程和 ODR ==========
+    ESP_LOGI(TAG, "[4/10] 配置陀螺仪...");
     uint8_t gyro_config0 = (s_config.gyro_fs << 5) | s_config.gyro_odr;
     icm42688_write_reg(ICM42688_REG_GYRO_CONFIG0, gyro_config0);
-    ESP_LOGI(TAG, "Gyro config: FS=%d, ODR=0x%02X", s_config.gyro_fs, s_config.gyro_odr);
+    ESP_LOGI(TAG, "  FS=%d (±%d dps), ODR=0x%02X",
+             s_config.gyro_fs,
+             s_config.gyro_fs == 0 ? 2000 :
+             s_config.gyro_fs == 1 ? 1000 :
+             s_config.gyro_fs == 2 ? 500 :
+             s_config.gyro_fs == 3 ? 250 : 125,
+             s_config.gyro_odr);
 
-    // 配置加速度计：量程 + ODR
+    // ========== 步骤 5: 配置加速度计量程和 ODR ==========
+    ESP_LOGI(TAG, "[5/10] 配置加速度计...");
     uint8_t accel_config0 = (s_config.accel_fs << 5) | s_config.accel_odr;
     icm42688_write_reg(ICM42688_REG_ACCEL_CONFIG0, accel_config0);
-    ESP_LOGI(TAG, "Accel config: FS=%d, ODR=0x%02X", s_config.accel_fs, s_config.accel_odr);
+    ESP_LOGI(TAG, "  FS=%d (±%dg), ODR=0x%02X",
+             s_config.accel_fs,
+             s_config.accel_fs == 0 ? 16 :
+             s_config.accel_fs == 1 ? 8 :
+             s_config.accel_fs == 2 ? 4 : 2,
+             s_config.accel_odr);
 
-    // 配置滤波器（可选）
-    // Gyro UI filter: BW = ODR/4
+    // ========== 步骤 6: 配置 UI 滤波器带宽 ==========
+    ESP_LOGI(TAG, "[6/10] 配置滤波器...");
     icm42688_write_reg(ICM42688_REG_GYRO_CONFIG1, 0x16);  // 2阶滤波器
     icm42688_write_reg(ICM42688_REG_GYRO_ACCEL_CONFIG0, 0x11);  // BW = ODR/4
+    ESP_LOGI(TAG, "  Gyro: 2阶滤波器, BW=ODR/4");
+    ESP_LOGI(TAG, "  Accel: 2阶滤波器, BW=ODR/4");
 
-    // 使能 6 轴低噪声模式
+    // ========== 步骤 7: 配置中断 (数据就绪 → INT1) ==========
+    ESP_LOGI(TAG, "[7/10] 配置中断...");
+    icm42688_config_interrupt(ICM42688_INT_STATUS_DATA_RDY);
+    ESP_LOGI(TAG, "  数据就绪中断 → INT1");
+
+    // ========== 步骤 8: 使能 6轴低噪声模式 ==========
+    ESP_LOGI(TAG, "[8/10] 使能 6轴低噪声模式...");
     uint8_t pwr_mgmt0 = ICM42688_PWR_MGMT0_GYRO_MODE_LN | ICM42688_PWR_MGMT0_ACCEL_MODE_LN;
     icm42688_write_reg(ICM42688_REG_PWR_MGMT0, pwr_mgmt0);
+    ESP_LOGI(TAG, "  Gyro: 低噪声模式");
+    ESP_LOGI(TAG, "  Accel: 低噪声模式");
 
-    // 等待陀螺仪启动（至少 45ms）
+    // ========== 步骤 9: 等待陀螺仪启动 (50ms) ==========
+    ESP_LOGI(TAG, "[9/10] 等待陀螺仪启动...");
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    // 配置数据就绪中断
-    icm42688_config_interrupt(ICM42688_INT_STATUS_DATA_RDY);
+    // ========== 步骤 10: 传感器自检 ==========
+    ESP_LOGI(TAG, "[10/10] 传感器自检...");
+    // 重新读取 WHO_AM_I 确认通信正常
+    device_id = icm42688_read_reg(ICM42688_REG_WHO_AM_I);
+    if (device_id != ICM42688_WHO_AM_I_VAL) {
+        ESP_LOGE(TAG, "  自检失败! WHO_AM_I = 0x%02X", device_id);
+        return -1;
+    }
+    ESP_LOGI(TAG, "  自检通过 ✓");
 
     // 更新灵敏度
     icm42688_update_sensitivity();
 
-    ESP_LOGI(TAG, "ICM-42688-P 初始化完成");
+    ESP_LOGI(TAG, "=== ICM-42688-P 初始化完成 ===");
     ESP_LOGI(TAG, "  Gyro sensitivity: %.4f dps/LSB", (double)(1.0f / s_gyro_sensitivity));
     ESP_LOGI(TAG, "  Accel sensitivity: %.4f g/LSB", (double)(1.0f / s_acc_sensitivity));
 
