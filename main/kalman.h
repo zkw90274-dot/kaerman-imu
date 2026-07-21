@@ -48,6 +48,7 @@ typedef struct {
 typedef struct {
     float roll;             // 横滚角（度）
     float pitch;            // 俯仰角（度）
+    float yaw;              // 偏航角（度，陀螺仪积分）
     float roll_rate;        // 横滚角速度（度/秒）
     float pitch_rate;       // 俯仰角速度（度/秒）
 } kalman_output_t;

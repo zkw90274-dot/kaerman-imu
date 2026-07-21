@@ -117,7 +117,7 @@ static void imu_task(void *arg)
 #if FILTER_TYPE == 0
     ESP_LOGI(TAG, "  Roll(X)   Pitch(Y)   Yaw(Z)   Vibration  Gyro(dps)");
 #else
-    ESP_LOGI(TAG, "  Roll(X)   Pitch(Y)   Gyro(dps)");
+    ESP_LOGI(TAG, "  Roll(X)   Pitch(Y)   Yaw(Z)   Gyro(dps)");
 #endif
     ESP_LOGI(TAG, "----------------------------------------------------------------");
 
@@ -147,8 +147,8 @@ static void imu_task(void *arg)
         kalman_output_t kalman_out;
         kalman_update(gx, gy, gz, data.ax, data.ay, data.az, SAMPLE_DT_S, &kalman_out);
 
-        ESP_LOGI(TAG, "  %+7.2f  %+7.2f    %.1f %.1f %.1f",
-                 (double)kalman_out.roll, (double)kalman_out.pitch,
+        ESP_LOGI(TAG, "  %+7.2f  %+7.2f  %+7.2f    %.1f %.1f %.1f",
+                 (double)kalman_out.roll, (double)kalman_out.pitch, (double)kalman_out.yaw,
                  (double)gx, (double)gy, (double)gz);
 #endif
 

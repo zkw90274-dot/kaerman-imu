@@ -30,12 +30,17 @@ static const char *TAG = "kalman";
 #define DEFAULT_Q_BIAS      0.003f      // 过程噪声（偏差）
 #define DEFAULT_R_MEASURE   0.03f       // 测量噪声
 
+/* ==================== Yaw 参数 ==================== */
+
+#define YAW_DEADZONE    0.5f            // Yaw 死区 (°/s)
+
 /* ==================== 模块状态 ==================== */
 
 static kalman_filter_t s_roll;          // Roll 角卡尔曼滤波器
 static kalman_filter_t s_pitch;         // Pitch 角卡尔曼滤波器
 static kalman_output_t s_output;        // 输出缓存
 static uint8_t s_inited = 0;            // 初始化标志
+static float s_yaw = 0.0f;             // Yaw 角（陀螺仪积分）
 
 /* ==================== 内部函数 ==================== */
 
@@ -140,19 +145,38 @@ void kalman_update(float gx, float gy, float gz,
 
     float acc_roll, acc_pitch;
 
-    /* 计算加速度计测量的角度 */
-    // Roll: atan(ay / az)
+    /*
+     * 计算加速度计测量的角度（与互补滤波坐标系一致）
+     *
+     * Roll (横滚角): 绕 X 轴旋转
+     *   - 由 Y 和 Z 轴加速度计算
+     *   - roll = atan2(ay, az)
+     *
+     * Pitch (俯仰角): 绕 Y 轴旋转
+     *   - 由 X 轴加速度和 YZ 平面合力计算
+     *   - pitch = -atan2(ax, sqrt(ay² + az²))
+     */
     acc_roll = imu_safe_atan2(ay, az) * IMU_RAD2DEG;
-
-    // Pitch: -atan(ax / sqrt(ay² + az²))
     acc_pitch = -imu_safe_atan2(ax, imu_inv_sqrt(ay * ay + az * az)) * IMU_RAD2DEG;
 
-    /* 更新卡尔曼滤波器 */
-    // 注意：这里用 gx, gy 作为角速度输入
-    // Roll 角用 gx（绕 X 轴旋转）
-    // Pitch 角用 gy（绕 Y 轴旋转）
+    /*
+     * 更新卡尔曼滤波器
+     *
+     * Roll 角用 gx（绕 X 轴角速度）
+     * Pitch 角用 gy（绕 Y 轴角速度）
+     */
     s_output.roll = kalman_filter_update(&s_roll, acc_roll, gx, dt);
     s_output.pitch = kalman_filter_update(&s_pitch, acc_pitch, gy, dt);
+
+    /*
+     * Yaw (偏航角): 绕 Z 轴旋转
+     *   - 纯加速度计无法测量 Yaw
+     *   - 使用陀螺仪积分 + 死区抑制漂移
+     */
+    if (gz > YAW_DEADZONE || gz < -YAW_DEADZONE) {
+        s_yaw += gz * dt;
+    }
+    s_output.yaw = s_yaw;
 
     // 保存角速度
     s_output.roll_rate = gx;
@@ -181,6 +205,7 @@ void kalman_reset(void)
 {
     kalman_filter_init(&s_roll);
     kalman_filter_init(&s_pitch);
+    s_yaw = 0.0f;
     memset(&s_output, 0, sizeof(s_output));
     ESP_LOGI(TAG, "卡尔曼滤波器已重置");
 }
