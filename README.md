@@ -1,5 +1,12 @@
 # kaerman — ESP32 IMU 姿态解算系统
 
+![Chip](https://img.shields.io/badge/Chip-ESP32--S3-blue?logo=espressif)
+![Sensor](https://img.shields.io/badge/Sensor-ICM--42688--P-blueviolet)
+![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v5.4.3-brightgreen?logo=espressif)
+![Language](https://img.shields.io/badge/Language-C17-orange?logo=c)
+![Sample Rate](https://img.shields.io/badge/Sample-200%20Hz-lightgrey)
+![Filters](https://img.shields.io/badge/Filters-Kalman%20%2B%20Mahony-success)
+
 > 基于 **ESP32-S3 + ICM-42688-P** 六轴传感器的双滤波器姿态解算系统。
 > 自适应卡尔曼滤波与 Mahony 互补滤波并行运行，输出四元数与欧拉角，通过 VOFA+ 上位机实时可视化。
 
@@ -37,29 +44,37 @@
 
 ## 系统架构
 
-```
-ICM-42688-P (SPI @ 10 MHz)
-    │
-    ▼
-icm42688 驱动 ──► 原始数据 (ax, ay, az, gx, gy, gz)
-    │
-    ▼
-零漂补偿（上电 500 样本标定，主循环统一扣除）
-    │
-    ├───────────────► Pipeline 1: 自适应卡尔曼滤波
-    │                   ├─ 振动检测 → R 自适应放大 (×10)
-    │                   ├─ 运动检测 → Q 自适应放大 (×5)
-    │                   ├─ Yaw 陀螺仪积分 + 死区
-    │                   └─ Roll/Pitch → 四元数 → 欧拉角
-    │
-    └───────────────► Pipeline 2: Mahony 互补滤波
-                        ├─ 振动检测 → Kp 自适应降低
-                        ├─ 误差积分限幅（防饱和）
-                        ├─ 加速度计初始化四元数
-                        └─ 四元数微分方程 → 欧拉角
-    │
-    ▼
-VOFA 输出: K:roll,pitch,yaw,M:roll,pitch,yaw  @ 200 Hz
+```mermaid
+flowchart TD
+    A["🎛️ ICM-42688-P<br/><small>SPI @ 10 MHz · 200 Hz ODR</small>"] --> B["icm42688 驱动<br/><small>ax / ay / az / gx / gy / gz</small>"]
+    B --> C["零漂补偿<br/><small>上电 500 样本标定 · 主循环统一扣除</small>"]
+
+    C --> K1
+    C --> M1
+
+    subgraph P1["Pipeline 1 · 自适应卡尔曼滤波"]
+        direction TB
+        K1["振动检测 → R ×10"] --> K2["运动检测 → Q ×5"]
+        K2 --> K3["Yaw 陀螺仪积分 + 死区"]
+        K3 --> K4["Roll/Pitch → 四元数"]
+    end
+
+    subgraph P2["Pipeline 2 · Mahony 互补滤波"]
+        direction TB
+        M1["振动检测 → Kp 降低"] --> M2["误差积分限幅"]
+        M2 --> M3["四元数微分方程"]
+    end
+
+    K4 --> Q1["四元数 → 欧拉角<br/><small>imu_math 共享库</small>"]
+    M3 --> Q1
+    Q1 --> V["📡 VOFA 输出 @ 200 Hz<br/><small>K:roll,pitch,yaw,M:roll,pitch,yaw</small>"]
+
+    style A fill:#dbeafe,stroke:#1f6feb,stroke-width:2px
+    style V fill:#dcfce7,stroke:#238636,stroke-width:2px
+    style C fill:#ede9fe,stroke:#8957e5,stroke-width:2px
+    style Q1 fill:#fef3c7,stroke:#bb8009,stroke-width:2px
+    style P1 fill:#f0f6ff,stroke:#58a6ff,stroke-dasharray:5 5
+    style P2 fill:#fff5f0,stroke:#f78166,stroke-dasharray:5 5
 ```
 
 ---
@@ -119,11 +134,17 @@ VOFA 输出: K:roll,pitch,yaw,M:roll,pitch,yaw  @ 200 Hz
 
 ## 启动流程
 
-1. 系统上电，延时 500 ms 等待稳定
-2. 初始化 ICM-42688-P，校验 WHO_AM_I
-3. **零漂标定**：保持传感器静止，采集 500 个陀螺仪样本求平均
-4. 初始化卡尔曼滤波器；读取一帧加速度计数据初始化 Mahony 四元数
-5. 进入 200 Hz 主循环：读数据 → 零漂补偿 → 双滤波 → VOFA 输出
+```mermaid
+flowchart LR
+    S1["⚡ 上电<br/><small>延时 500 ms</small>"] --> S2["初始化 ICM-42688<br/><small>校验 WHO_AM_I</small>"]
+    S2 --> S3["零漂标定<br/><small>静止采 500 样本</small>"]
+    S3 --> S4["滤波器初始化<br/><small>Kalman 复位<br/>Mahony 加速度计对准</small>"]
+    S4 --> S5["🔁 200 Hz 主循环<br/><small>读取 → 补偿 → 双滤波 → 输出</small>"]
+
+    style S1 fill:#dbeafe,stroke:#1f6feb,stroke-width:2px
+    style S3 fill:#ede9fe,stroke:#8957e5,stroke-width:2px
+    style S5 fill:#dcfce7,stroke:#238636,stroke-width:2px
+```
 
 ---
 
